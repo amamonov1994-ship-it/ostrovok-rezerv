@@ -112,19 +112,37 @@ otmena() {
 
   # --- 1. погасить службы, которых до установки не было ---
   govorit "1. Гашу службы, которые появились от набора."
-  if [ -f "$SNAP/sluzhby-do.txt" ]; then
+  if [ -f "$SNAP/sluzhby-do.txt" ] || [ -f "$SNAP/rabotali-do.txt" ]; then
+    bylo="/tmp/ostrovok-bylo-do.txt"
+    cat "$SNAP/sluzhby-do.txt" "$SNAP/rabotali-do.txt" 2>/dev/null | sort -u > "$bylo"
     for spisok in "$NABOR/sluzhby.txt" "$NABOR/rabotali.txt"; do
       [ -f "$spisok" ] || continue
       while read -r unit; do
         [ -n "$unit" ] || continue
-        grep -qxF "$unit" "$SNAP/sluzhby-do.txt" 2>/dev/null && continue
+        # была на машине до установки — не трогаем
+        grep -qxF "$unit" "$bylo" 2>/dev/null && continue
+        # системные службы не гасим никогда, даже если их не было в списке
+        case "$unit" in
+          dbus*|ssh*|systemd-*|getty@*|user@*|cron*|apparmor*|chrony*|fail2ban*|\
+          mariadb*|mysql*|networking*|polkit*|rsyslog*|unattended-upgrades*|\
+          apt-daily*|snapd*|multipathd*|udev*|plymouth*|resolv*|NetworkManager*|\
+          ModemManager*|accounts-daemon*|udisks*|upower*|thermald*|irqbalance*)
+            govorit "   оставляю системную: $unit"
+            continue ;;
+        esac
+        # и последняя страховка: набор кладёт свои юниты в /etc/systemd/system
+        if [ ! -f "/etc/systemd/system/$unit" ]; then
+          govorit "   оставляю (это не юнит набора): $unit"
+          continue
+        fi
         systemctl stop "$unit"    >/dev/null 2>&1 || true
         systemctl disable "$unit" >/dev/null 2>&1 || true
         govorit "   погашена: $unit"
       done < "$spisok"
     done
+    rm -f "$bylo"
   else
-    govorit "   списка прежних служб нет, пропускаю."
+    govorit "   списков прежних служб нет, пропускаю."
   fi
   systemctl daemon-reload >/dev/null 2>&1 || true
   ladno
@@ -179,7 +197,14 @@ otmena() {
     export DEBIAN_FRONTEND=noninteractive
     dpkg --set-selections < "$SNAP/pakety-do.txt" || govorit "   часть строк пакетов пропущена"
     apt-get update -qq || true
-    apt-get -y dselect-upgrade || govorit "   часть пакетов не снялась, продолжаю"
+    if ! apt-get -y dselect-upgrade; then
+      govorit "   Целиком не пошло: две программы сцепились версиями."
+      govorit "   Пробую ещё раз по частям."
+      apt-get -y --fix-broken install >/dev/null 2>&1 || true
+      apt-get -y dselect-upgrade >/dev/null 2>&1 || true
+      govorit "   Часть поставленных пакетов могла остаться. На работу это не влияет:"
+      govorit "   службы, настройки, учётки и файлы уже вернулись прежними."
+    fi
     ladno
   else
     govorit "   списка пакетов нет, пропускаю."
@@ -190,8 +215,23 @@ otmena() {
   systemctl daemon-reload >/dev/null 2>&1 || true
   govorit "ПРОВЕРЯЮ РЕЗУЛЬТАТ"
   sleep 2
-  govorit "Портал Островка: $(systemctl is-active tt5@ostrovok 2>/dev/null) — так и должно быть, его здесь больше нет."
-  govorit "Сайт Островка:   $(systemctl is-active ostrovok-web 2>/dev/null) — так и должно быть."
+  # Здесь только рассказываю, как дела. Гасить — дело первого шага: у него
+  # есть все списки и защиты. Спискам из снимка верить нельзя: в старом снимке
+  # нет ни tt5@ostrovok, ни шаблона tt5@.service, и портал выглядел «чужим».
+  # Зато первый шаг гасит всё, что принесла установка, а службу, которую он
+  # оставил, он же и назвал в журнале. Значит живая служба после отмены —
+  # та, что работала и до неё.
+  for para in "tt5@ostrovok|Портал Островка" "ostrovok-web|Сайт Островка"; do
+    unit="${para%%|*}"; nazvanie="${para##*|}"
+    sost="$(systemctl is-active "$unit" 2>/dev/null)"
+    if [ "$sost" = "active" ]; then
+      govorit "$nazvanie: работает. Я её не гасил — значит она работала и до установки."
+    elif [ "$sost" = "inactive" ]; then
+      govorit "$nazvanie: погашена — как и должно быть: её принесла установка."
+    else
+      govorit "$nazvanie: $sost. Загляни в журнал: journalctl -u $unit -n 30"
+    fi
+  done
   probel
   govorit "ОТМЕНА ЗАВЕРШЕНА"
   probel
@@ -369,6 +409,10 @@ KONEC
   dpkg --get-selections > "$SNAP/pakety-do.txt" 2>/dev/null || true
   systemctl list-unit-files --state=enabled --no-legend 2>/dev/null \
       | awk '{print $1}' | sort -u > "$SNAP/sluzhby-do.txt" 2>/dev/null || true
+  # не только включённые, но и просто работавшие: dbus, ssh через сокет, user@
+  # в списке enabled не числятся, а при отмене их гасить нельзя
+  systemctl list-units --type=service --state=running --no-legend 2>/dev/null \
+      | awk '{print $1}' | sort -u > "$SNAP/rabotali-do.txt" 2>/dev/null || true
 
   if command -v mysql >/dev/null 2>&1 && mysql -e 'select 1' >/dev/null 2>&1; then
     govorit "  запоминаю базу данных"
@@ -390,7 +434,15 @@ shag 4 $ALLGO "Ставлю пакеты. Это самая долгая час�
 if [ -f "$NABOR/pakety.txt" ]; then
   dpkg --set-selections < "$NABOR/pakety.txt" || govorit "  часть строк пакетов пропущена"
   apt-get update -qq || true
-  apt-get -y dselect-upgrade || govorit "  часть пакетов не встала, продолжаю дальше"
+  if ! apt-get -y dselect-upgrade; then
+    govorit "  Пачка не пошла целиком: одна программа сцепилась версиями и увела за собой все."
+    govorit "  Ставлю поодиночке — что сможет, то встанет, остальное не задержит."
+    dpkg --get-selections | awk '$2=="install"{print $1}' | while read -r pak; do
+      dpkg -s "$pak" 2>/dev/null | grep -qx 'Status: install ok installed' && continue
+      apt-get install -y -qq "$pak" >/dev/null 2>&1 || true
+    done
+    govorit "  Поодиночке прошёл. Что не встало — видно по журналу, сайту и ботам это не мешает."
+  fi
   ladno
 else
   govorit "  списка пакетов нет, пропускаю."
